@@ -92,6 +92,55 @@ def load_model_checkpoint(model, optimizer, checkpoint_path):
     
     return checkpoint
 
+def setup_distributed_model(model):
+    if not (ddp or distributed_type == 'fsdp'):
+        return model
+    
+    if distributed_type == 'ddp':
+        return DDP(model, device_ids=[ddp_local_rank])
+    
+    elif distributed_type == 'fsdp':
+        # Configure FSDP sharding strategy
+        if fsdp_sharding_strategy == 'full':
+            sharding_strategy = ShardingStrategy.FULL_SHARD
+        elif fsdp_sharding_strategy == 'grad':
+            sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
+        elif fsdp_sharding_strategy == 'param':
+            sharding_strategy = ShardingStrategy.HYBRID_SHARD
+        else:
+            raise ValueError(f"Unknown sharding strategy: {fsdp_sharding_strategy}")
+
+        # Configure mixed precision
+        mixed_precision_policy = None
+        if dtype == 'bfloat16':
+            mixed_precision_policy = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            )
+        elif dtype == 'float16':
+            mixed_precision_policy = MixedPrecision(
+                param_dtype=torch.float16,
+                reduce_dtype=torch.float16,
+                buffer_dtype=torch.float16,
+            )
+
+        # Define transformer wrapping policy
+        nanogpt_auto_wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
+
+        # Initialize FSDP wrapped model
+        model = FSDP(
+            model,
+            auto_wrap_policy=nanogpt_auto_wrap_policy,
+            sharding_strategy=sharding_strategy,
+            mixed_precision=mixed_precision_policy,
+            device_id=torch.cuda.current_device(),
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            use_orig_params=True,
+        )
+        
+        return model
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -224,25 +273,29 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = load_model_checkpoint(model, optimizer, ckpt_path)
+    checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    
+    if distributed_type == 'fsdp':
+        # Need to wrap before loading state dict for FSDP
+        model = setup_distributed_model(model)
+        model.load_state_dict(checkpoint['model'])
+    else:
+        state_dict = checkpoint['model']
+        # fix the keys of the state dictionary :(
+        unwanted_prefix = '_orig_mod.'
+        for k,v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        model.load_state_dict(state_dict)
+    
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
@@ -273,55 +326,6 @@ if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
-
-def setup_distributed_model(model):
-    if not (ddp or distributed_type == 'fsdp'):
-        return model
-    
-    if distributed_type == 'ddp':
-        return DDP(model, device_ids=[ddp_local_rank])
-    
-    elif distributed_type == 'fsdp':
-        # Configure FSDP sharding strategy
-        if fsdp_sharding_strategy == 'full':
-            sharding_strategy = ShardingStrategy.FULL_SHARD
-        elif fsdp_sharding_strategy == 'grad':
-            sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
-        elif fsdp_sharding_strategy == 'param':
-            sharding_strategy = ShardingStrategy.HYBRID_SHARD
-        else:
-            raise ValueError(f"Unknown sharding strategy: {fsdp_sharding_strategy}")
-
-        # Configure mixed precision
-        mixed_precision_policy = None
-        if dtype == 'bfloat16':
-            mixed_precision_policy = MixedPrecision(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
-                buffer_dtype=torch.bfloat16,
-            )
-        elif dtype == 'float16':
-            mixed_precision_policy = MixedPrecision(
-                param_dtype=torch.float16,
-                reduce_dtype=torch.float16,
-                buffer_dtype=torch.float16,
-            )
-
-        # Define transformer wrapping policy
-        nanogpt_auto_wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
-
-        # Initialize FSDP wrapped model
-        model = FSDP(
-            model,
-            auto_wrap_policy=nanogpt_auto_wrap_policy,
-            sharding_strategy=sharding_strategy,
-            mixed_precision=mixed_precision_policy,
-            device_id=torch.cuda.current_device(),
-            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-            use_orig_params=True,
-        )
-        
-        return model
 
 # wrap model into DDP or FSDP container
 model = setup_distributed_model(model)
