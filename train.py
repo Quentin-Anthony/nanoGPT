@@ -30,6 +30,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import functools
 
 import numpy as np
 import torch
@@ -307,14 +308,12 @@ def setup_distributed_model(model):
             )
 
         # Define transformer wrapping policy
-        transformer_wrap_policy = transformer_auto_wrap_policy(
-            transformer_layer_cls={Block}
-        )
+        nanogpt_auto_wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
 
         # Initialize FSDP wrapped model
         model = FSDP(
             model,
-            auto_wrap_policy=transformer_wrap_policy,
+            auto_wrap_policy=nanogpt_auto_wrap_policy,
             sharding_strategy=sharding_strategy,
             mixed_precision=mixed_precision_policy,
             device_id=torch.cuda.current_device(),
