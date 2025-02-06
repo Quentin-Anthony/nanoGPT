@@ -59,7 +59,6 @@ def get_raw_model(model):
 def save_model_checkpoint(model, optimizer, checkpoint_dict, filepath):
     """Save a checkpoint with appropriate handling of FSDP vs DDP models."""
     if distributed_type == 'fsdp':
-        # FSDP models need special handling for state dict
         full_state_dict = model.state_dict()
         if master_process:
             checkpoint_dict['model'] = full_state_dict
