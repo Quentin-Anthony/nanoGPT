@@ -1,14 +1,23 @@
 """
 This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
+and also in a larger training run with distributed data parallel (ddp) or
+fully sharded data parallel (fsdp).
 
 To run on a single GPU, example:
 $ python train.py --batch_size=32 --compile=False
 
 To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
+$ torchrun --standalone --nproc_per_node=4 train.py --distributed_type=ddp
 
-To run with DDP on 4 gpus across 2 nodes, example:
+To run with full FSDP on 4 gpus on 1 node, example:
+$ torchrun --standalone --nproc_per_node=4 train.py --distributed_type=fsdp --fsdp_sharding_strategy=full
+
+Available FSDP sharding strategies:
+- full: Full sharding of parameters, gradients, and optimizer states
+- grad: Gradient-only sharding
+- param: Parameter-only sharding
+
+To run with DDP/FSDP on 4 gpus across 2 nodes, example:
 - Run on the first (master) node with example IP 123.456.123.456:
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
 - Run on the worker node:
@@ -26,8 +35,61 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    BackwardPrefetch,
+    ShardingStrategy,
+    CPUOffload,
+)
+from torch.distributed.fsdp.wrap import (
+    transformer_auto_wrap_policy,
+    size_based_auto_wrap_policy,
+    enable_wrap,
+    wrap,
+)
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, Block
+
+def get_raw_model(model):
+    """Get the underlying model from DDP/FSDP wrapper if it exists."""
+    return model.module if hasattr(model, 'module') else model
+
+def save_model_checkpoint(model, optimizer, checkpoint_dict, filepath):
+    """Save a checkpoint with appropriate handling of FSDP vs DDP models."""
+    if distributed_type == 'fsdp':
+        # FSDP models need special handling for state dict
+        full_state_dict = model.state_dict()
+        if master_process:
+            checkpoint_dict['model'] = full_state_dict
+    else:
+        # Regular DDP or single-GPU model
+        if master_process:
+            checkpoint_dict['model'] = raw_model.state_dict()
+
+    checkpoint_dict['optimizer'] = optimizer.state_dict()        
+    torch.save(checkpoint_dict, filepath)
+
+def load_model_checkpoint(model, optimizer, checkpoint_path):
+    """Load a checkpoint with appropriate handling of FSDP vs DDP models."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    state_dict = checkpoint['model']
+    # fix the keys of the state dictionary :(
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    
+    if distributed_type == 'fsdp':
+        model.load_state_dict(state_dict)
+    else:
+        get_raw_model(model).load_state_dict(state_dict)
+    
+    if 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    
+    return checkpoint
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -66,8 +128,11 @@ decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
+# FSDP and DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
+distributed_type = 'ddp' # 'ddp' or 'fsdp'
+fsdp_sharding_strategy = 'full' # 'full', 'grad', or 'param'
+
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
@@ -157,14 +222,15 @@ if init_from == 'scratch':
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = load_model_checkpoint(model, optimizer, ckpt_path)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+    iter_num = checkpoint['iter_num']
+    best_val_loss = checkpoint['best_val_loss']
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -207,9 +273,59 @@ if compile:
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+def setup_distributed_model(model):
+    if not (ddp or distributed_type == 'fsdp'):
+        return model
+    
+    if distributed_type == 'ddp':
+        return DDP(model, device_ids=[ddp_local_rank])
+    
+    elif distributed_type == 'fsdp':
+        # Configure FSDP sharding strategy
+        if fsdp_sharding_strategy == 'full':
+            sharding_strategy = ShardingStrategy.FULL_SHARD
+        elif fsdp_sharding_strategy == 'grad':
+            sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
+        elif fsdp_sharding_strategy == 'param':
+            sharding_strategy = ShardingStrategy.HYBRID_SHARD
+        else:
+            raise ValueError(f"Unknown sharding strategy: {fsdp_sharding_strategy}")
+
+        # Configure mixed precision
+        mixed_precision_policy = None
+        if dtype == 'bfloat16':
+            mixed_precision_policy = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            )
+        elif dtype == 'float16':
+            mixed_precision_policy = MixedPrecision(
+                param_dtype=torch.float16,
+                reduce_dtype=torch.float16,
+                buffer_dtype=torch.float16,
+            )
+
+        # Define transformer wrapping policy
+        transformer_wrap_policy = transformer_auto_wrap_policy(
+            transformer_layer_cls={Block}
+        )
+
+        # Initialize FSDP wrapped model
+        model = FSDP(
+            model,
+            auto_wrap_policy=transformer_wrap_policy,
+            sharding_strategy=sharding_strategy,
+            mixed_precision=mixed_precision_policy,
+            device_id=torch.cuda.current_device(),
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            use_orig_params=True,
+        )
+        
+        return model
+
+# wrap model into DDP or FSDP container
+model = setup_distributed_model(model)
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -275,15 +391,18 @@ while True:
             best_val_loss = losses['val']
             if iter_num > 0:
                 checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                save_model_checkpoint(
+                    model, 
+                    optimizer, 
+                    checkpoint, 
+                    os.path.join(out_dir, 'ckpt.pt')
+                )
     if iter_num == 0 and eval_only:
         break
 
@@ -322,7 +441,8 @@ while True:
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            mfu = get_raw_model(model).estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
